@@ -1,0 +1,9 @@
+services:
+  crosspost:
+    build: .
+    container_name: crosspost-admin
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env

@@ -1,0 +1,17 @@
+{
+  "name": "crosspost-admin",
+  "version": "1.0.0",
+  "description": "Simple local admin panel to cross-post to Bluesky and Mastodon",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "image-size": "^2.0.2",
+    "multer": "^2.3.0"
+  }
+}

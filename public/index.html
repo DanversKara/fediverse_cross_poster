@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cross-Post Admin</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1d2025;
+    --border: #2c3038;
+    --text: #e7e9ec;
+    --muted: #9099a6;
+    --accent: #4f8cff;
+    --ok: #37c26b;
+    --err: #e5534b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    justify-content: center;
+    padding: 40px 16px;
+  }
+  .card {
+    width: 100%;
+    max-width: 620px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+  }
+  h1 {
+    font-size: 20px;
+    margin: 0 0 4px;
+  }
+  p.sub {
+    color: var(--muted);
+    margin: 0 0 24px;
+    font-size: 14px;
+  }
+  textarea {
+    width: 100%;
+    min-height: 140px;
+    resize: vertical;
+    background: #101215;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    padding: 14px;
+    font-size: 15px;
+    line-height: 1.4;
+  }
+  textarea:focus { outline: 1px solid var(--accent); }
+  .meta-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 8px;
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .targets {
+    display: flex;
+    gap: 12px;
+    margin-top: 20px;
+    flex-wrap: wrap;
+  }
+  .target {
+    flex: 1;
+    min-width: 220px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+    background: #191c21;
+  }
+  .target.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .target input { width: 16px; height: 16px; }
+  .target .name { font-weight: 600; font-size: 14px; }
+  .target .desc { font-size: 12px; color: var(--muted); }
+  button#postBtn {
+    margin-top: 24px;
+    width: 100%;
+    background: var(--accent);
+    border: none;
+    color: white;
+    font-size: 15px;
+    font-weight: 600;
+    padding: 14px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  button#postBtn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .results {
+    margin-top: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .result {
+    border-radius: 8px;
+    padding: 12px 14px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+  }
+  .result.ok { border-color: var(--ok); }
+  .result.err { border-color: var(--err); }
+  .result .platform { font-weight: 700; text-transform: capitalize; margin-bottom: 4px; }
+  .result a { color: var(--accent); }
+
+  .media-section { margin-top: 20px; }
+  .media-dropzone {
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .media-dropzone:hover { border-color: var(--accent); color: var(--text); }
+  .media-hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .media-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .media-item {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    background: #191c21;
+  }
+  .media-item .thumb-wrap { position: relative; }
+  .media-item img, .media-item video {
+    width: 100%;
+    height: 90px;
+    object-fit: cover;
+    border-radius: 6px;
+    background: #000;
+    display: block;
+  }
+  .media-item .remove {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: rgba(0,0,0,0.6);
+    color: #fff;
+    border: none;
+    border-radius: 50%;
+    width: 22px;
+    height: 22px;
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .media-item input.alt {
+    width: 100%;
+    margin-top: 6px;
+    font-size: 11px;
+    background: #101215;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 5px 6px;
+  }
+  .media-item .filename {
+    font-size: 10px;
+    color: var(--muted);
+    margin-top: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .media-error {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--err);
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Cross-Post</h1>
+    <p class="sub">Write once, post to Bluesky &amp; Mastodon.</p>
+
+    <textarea id="text" maxlength="500" placeholder="What's happening?"></textarea>
+    <div class="meta-row">
+      <span id="charCount">0 / 500</span>
+    </div>
+
+    <div class="media-section">
+      <label class="media-dropzone" id="dropzone">
+        <input type="file" id="mediaInput" accept="image/*,video/*" multiple hidden />
+        Click to add photos or one video
+      </label>
+      <div class="media-hint" id="mediaHint">Loading media limits…</div>
+      <div class="media-grid" id="mediaGrid"></div>
+      <div class="media-error" id="mediaError"></div>
+    </div>
+
+    <div class="targets">
+      <label class="target" id="targetBluesky">
+        <input type="checkbox" value="bluesky" checked />
+        <div>
+          <div class="name">Bluesky</div>
+          <div class="desc" id="blueskyDesc">checking config…</div>
+        </div>
+      </label>
+      <label class="target" id="targetMastodon">
+        <input type="checkbox" value="mastodon" checked />
+        <div>
+          <div class="name">Mastodon</div>
+          <div class="desc" id="mastodonDesc">checking config…</div>
+        </div>
+      </label>
+    </div>
+
+    <button id="postBtn">Post</button>
+
+    <div class="results" id="results"></div>
+  </div>
+
+<script>
+const textEl = document.getElementById('text');
+const charCount = document.getElementById('charCount');
+const postBtn = document.getElementById('postBtn');
+const resultsEl = document.getElementById('results');
+const dropzone = document.getElementById('dropzone');
+const mediaInput = document.getElementById('mediaInput');
+const mediaHint = document.getElementById('mediaHint');
+const mediaGrid = document.getElementById('mediaGrid');
+const mediaError = document.getElementById('mediaError');
+
+let rawLimits = null; // { bluesky: {...}, mastodon: {...} } from /api/config
+let mediaLimits = null; // combined limits for the currently checked targets
+let mediaItems = []; // [{ file, altText, url, kind: 'image'|'video' }]
+
+textEl.addEventListener('input', () => {
+  charCount.textContent = `${textEl.value.length} / 500`;
+});
+
+function fmtMB(bytes) {
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function currentTargets() {
+  return Array.from(document.querySelectorAll('.targets input:checked')).map(i => i.value);
+}
+
+// Recompute the limits the UI should enforce, based on which platforms are
+// currently checked — not always both. Unchecking a platform relaxes the
+// constraint to whatever the remaining platform(s) allow.
+function recomputeMediaLimits() {
+  const targets = currentTargets();
+  const active = targets.map(t => rawLimits && rawLimits[t]).filter(Boolean);
+
+  if (active.length === 0) {
+    mediaLimits = null;
+    mediaHint.textContent = 'Select a platform to see media limits.';
+    return;
+  }
+
+  const minOf = (nums) => {
+    const defined = nums.filter(n => n !== null && n !== undefined);
+    return defined.length ? Math.min(...defined) : null;
+  };
+  const intersect = (lists) => lists.reduce((acc, l) => acc ? acc.filter(m => l.includes(m)) : l, null);
+
+  mediaLimits = {
+    maxImages: minOf(active.map(l => l.maxImages)),
+    imageMaxBytes: minOf(active.map(l => l.imageMaxBytes)),
+    imageMimeTypes: intersect(active.map(l => l.imageMimeTypes)),
+    videoMaxBytes: minOf(active.map(l => l.videoMaxBytes)),
+    videoMaxDurationSec: minOf(active.map(l => l.videoMaxDurationSec)),
+    videoMimeTypes: intersect(active.map(l => l.videoMimeTypes)),
+  };
+
+  const platformNote = targets.length > 1 ? 'both selected platforms' : targets[0];
+  const durationNote = mediaLimits.videoMaxDurationSec
+    ? `, ~${Math.round(mediaLimits.videoMaxDurationSec / 60)} min`
+    : '';
+  mediaHint.textContent =
+    `Up to ${mediaLimits.maxImages} images (max ${fmtMB(mediaLimits.imageMaxBytes)} each), ` +
+    `or 1 video (max ${fmtMB(mediaLimits.videoMaxBytes)}${durationNote}). ` +
+    `Limits shown are for ${platformNote}.`;
+
+  // Already-attached files might now exceed the new (tighter) limits, or be
+  // fine again under looser ones — re-check and flag anything that no longer fits.
+  reflagExistingMedia();
+}
+
+function reflagExistingMedia() {
+  mediaError.textContent = '';
+  if (!mediaLimits) return;
+
+  const images = mediaItems.filter(i => i.kind === 'image');
+  const video = mediaItems.find(i => i.kind === 'video');
+
+  if (video) {
+    if (!mediaLimits.videoMimeTypes.includes(video.file.type)) {
+      mediaError.textContent = `${video.file.name}: format not supported by the currently selected platform(s).`;
+    } else if (video.file.size > mediaLimits.videoMaxBytes) {
+      mediaError.textContent = `${video.file.name} is ${fmtMB(video.file.size)}, over the ${fmtMB(mediaLimits.videoMaxBytes)} limit for the currently selected platform(s).`;
+    }
+    return;
+  }
+
+  if (images.length > mediaLimits.maxImages) {
+    mediaError.textContent = `Only ${mediaLimits.maxImages} images allowed for the currently selected platform(s) — remove ${images.length - mediaLimits.maxImages}.`;
+    return;
+  }
+
+  for (const img of images) {
+    if (!mediaLimits.imageMimeTypes.includes(img.file.type)) {
+      mediaError.textContent = `${img.file.name}: format not supported by the currently selected platform(s).`;
+      return;
+    }
+    if (img.file.size > mediaLimits.imageMaxBytes) {
+      mediaError.textContent = `${img.file.name} is ${fmtMB(img.file.size)}, over the ${fmtMB(mediaLimits.imageMaxBytes)} limit for the currently selected platform(s).`;
+      return;
+    }
+  }
+}
+
+function renderMediaGrid() {
+  mediaGrid.innerHTML = '';
+  mediaItems.forEach((item, idx) => {
+    const cell = document.createElement('div');
+    cell.className = 'media-item';
+
+    const wrap = document.createElement('div');
+    wrap.className = 'thumb-wrap';
+
+    const media = item.kind === 'video' ? document.createElement('video') : document.createElement('img');
+    media.src = item.url;
+    if (item.kind === 'video') { media.muted = true; media.controls = true; }
+    wrap.appendChild(media);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove';
+    removeBtn.textContent = '×';
+    removeBtn.title = 'Remove';
+    removeBtn.addEventListener('click', () => {
+      URL.revokeObjectURL(item.url);
+      mediaItems.splice(idx, 1);
+      renderMediaGrid();
+    });
+    wrap.appendChild(removeBtn);
+
+    cell.appendChild(wrap);
+
+    const name = document.createElement('div');
+    name.className = 'filename';
+    name.textContent = item.file.name;
+    cell.appendChild(name);
+
+    const altInput = document.createElement('input');
+    altInput.className = 'alt';
+    altInput.placeholder = 'Alt text (recommended)';
+    altInput.value = item.altText;
+    altInput.addEventListener('input', () => { item.altText = altInput.value; });
+    cell.appendChild(altInput);
+
+    mediaGrid.appendChild(cell);
+  });
+}
+
+function validateNewFiles(files) {
+  mediaError.textContent = '';
+  if (!mediaLimits) return [];
+
+  const existingImages = mediaItems.filter(i => i.kind === 'image').length;
+  const existingVideo = mediaItems.some(i => i.kind === 'video');
+  const incoming = Array.from(files);
+
+  const incomingVideos = incoming.filter(f => f.type.startsWith('video/'));
+  const incomingImages = incoming.filter(f => f.type.startsWith('image/'));
+
+  if (existingVideo || incomingVideos.length > 0) {
+    if (mediaItems.length > 0 || incoming.length > 1 || incomingImages.length > 0) {
+      mediaError.textContent = 'A post can have either images or one video, not both — and only one video.';
+      return [];
+    }
+  }
+
+  if (incomingImages.length > 0 && existingImages + incomingImages.length > mediaLimits.maxImages) {
+    mediaError.textContent = `Up to ${mediaLimits.maxImages} images are allowed.`;
+    return [];
+  }
+
+  const accepted = [];
+  for (const f of incoming) {
+    const kind = f.type.startsWith('video/') ? 'video' : f.type.startsWith('image/') ? 'image' : null;
+    if (!kind) {
+      mediaError.textContent = `${f.name}: unsupported file type.`;
+      continue;
+    }
+    const mimeList = kind === 'video' ? mediaLimits.videoMimeTypes : mediaLimits.imageMimeTypes;
+    const maxBytes = kind === 'video' ? mediaLimits.videoMaxBytes : mediaLimits.imageMaxBytes;
+    if (!mimeList.includes(f.type)) {
+      mediaError.textContent = `${f.name}: format not supported by the currently selected platform(s).`;
+      continue;
+    }
+    if (f.size > maxBytes) {
+      mediaError.textContent = `${f.name} is ${fmtMB(f.size)}, over the ${fmtMB(maxBytes)} limit for the currently selected platform(s).`;
+      continue;
+    }
+    accepted.push({ file: f, altText: '', url: URL.createObjectURL(f), kind });
+  }
+  return accepted;
+}
+
+dropzone.addEventListener('click', () => mediaInput.click());
+mediaInput.addEventListener('change', () => {
+  const accepted = validateNewFiles(mediaInput.files);
+  mediaItems.push(...accepted);
+  renderMediaGrid();
+  mediaInput.value = '';
+});
+
+async function loadConfig() {
+  try {
+    const res = await fetch('/api/config');
+    const cfg = await res.json();
+
+    rawLimits = cfg.mediaLimits;
+
+    const bsBox = document.querySelector('#targetBluesky input');
+    const mdBox = document.querySelector('#targetMastodon input');
+
+    document.getElementById('blueskyDesc').textContent = cfg.bluesky
+      ? 'configured'
+      : 'not configured';
+    document.getElementById('mastodonDesc').textContent = cfg.mastodon
+      ? cfg.mastodonInstance.replace('https://', '')
+      : 'not configured';
+
+    if (!cfg.bluesky) {
+      bsBox.checked = false;
+      bsBox.disabled = true;
+      document.getElementById('targetBluesky').classList.add('disabled');
+    }
+    if (!cfg.mastodon) {
+      mdBox.checked = false;
+      mdBox.disabled = true;
+      document.getElementById('targetMastodon').classList.add('disabled');
+    }
+
+    bsBox.addEventListener('change', recomputeMediaLimits);
+    mdBox.addEventListener('change', recomputeMediaLimits);
+    recomputeMediaLimits();
+  } catch (e) {
+    console.error(e);
+  }
+}
+loadConfig();
+
+postBtn.addEventListener('click', async () => {
+  const text = textEl.value.trim();
+  if (!text) return;
+
+  const targets = Array.from(document.querySelectorAll('.targets input:checked')).map(i => i.value);
+  if (targets.length === 0) return;
+
+  postBtn.disabled = true;
+  postBtn.textContent = 'Posting…';
+  resultsEl.innerHTML = '';
+
+  try {
+    const form = new FormData();
+    form.append('text', text);
+    form.append('targets', JSON.stringify(targets));
+    form.append('altTexts', JSON.stringify(mediaItems.map(i => i.altText)));
+    mediaItems.forEach(i => form.append('media', i.file));
+
+    const res = await fetch('/api/post', {
+      method: 'POST',
+      body: form
+    });
+    const data = await res.json();
+
+    if (data.error) {
+      const div = document.createElement('div');
+      div.className = 'result err';
+      div.textContent = data.error;
+      resultsEl.appendChild(div);
+      return;
+    }
+
+    for (const [platform, result] of Object.entries(data.results || {})) {
+      const div = document.createElement('div');
+      div.className = `result ${result.ok ? 'ok' : 'err'}`;
+      if (result.ok) {
+        const link = result.url || result.uri || '';
+        div.innerHTML = `<div class="platform">${platform}</div>Posted successfully.${link ? ` <a href="${link}" target="_blank" rel="noopener">View</a>` : ''}`;
+      } else {
+        div.innerHTML = `<div class="platform">${platform}</div>${result.error}`;
+      }
+      resultsEl.appendChild(div);
+    }
+
+    if (Object.values(data.results || {}).some(r => r.ok)) {
+      textEl.value = '';
+      charCount.textContent = '0 / 500';
+      mediaItems.forEach(i => URL.revokeObjectURL(i.url));
+      mediaItems = [];
+      renderMediaGrid();
+    }
+  } catch (e) {
+    const div = document.createElement('div');
+    div.className = 'result err';
+    div.textContent = 'Request failed: ' + e.message;
+    resultsEl.appendChild(div);
+  } finally {
+    postBtn.disabled = false;
+    postBtn.textContent = 'Post';
+  }
+});
+</script>
+</body>
+</html>
