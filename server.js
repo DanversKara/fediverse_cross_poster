@@ -1,12 +1,57 @@
+const dns = require('dns');
+const net = require('net');
 const express = require('express');
 const path = require('path');
 const multer = require('multer');
 const { imageSize } = require('image-size');
+const { optimizeImageForLimits, optimizeVideoForLimits } = require('./mediaOptimizer');
+
+// Node (from v18+) tries a host's IPv4 and IPv6 addresses in parallel
+// ("happy eyeballs") and picks whichever connects first. Inside a lot of
+// Docker setups there's no real outbound IPv6 route — every IPv6 attempt
+// fails/times out immediately, and a known Node bug means that fast failure
+// doesn't reliably trigger the IPv4 fallback in time, so the otherwise-fine
+// IPv4 connection stalls until it also times out (nodejs/node#48822).
+//
+// dns.setDefaultResultOrder only changes which address DNS returns first —
+// it does NOT stop Node from racing both families. The actual fix is to
+// disable the race entirely so Node just uses the first resolved address.
+dns.setDefaultResultOrder('ipv4first');
+net.setDefaultAutoSelectFamily(false);
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 8080;
+
+// Node's fetch throws a bare "fetch failed" TypeError for any network-level
+// failure (DNS lookup, connection refused, TLS handshake, timeout, etc.) —
+// the actually-useful reason lives one level down in `error.cause`, and for
+// dual-stack connection failures `cause` is itself an AggregateError whose
+// real per-address errors are hiding in `cause.errors` — one level deeper
+// still. This unwraps all of that instead of dropping it.
+async function fetchWithContext(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (e) {
+    let detail = e.message;
+    const cause = e.cause;
+    if (cause) {
+      if (Array.isArray(cause.errors)) {
+        // AggregateError from a dual-stack (IPv4 + IPv6) connect attempt —
+        // one sub-error per address it tried.
+        const attempts = cause.errors.map((err) => {
+          const addr = err.address ? `${err.address}:${err.port || ''}` : '';
+          return `${err.code || err.message}${addr ? ` (${addr})` : ''}`;
+        });
+        detail += `: ${attempts.join(', ')}`;
+      } else {
+        detail += `: ${cause.code || ''} ${cause.message || cause}`.trim();
+      }
+    }
+    throw new Error(`Request to ${url} failed: ${detail}`);
+  }
+}
 
 const BLUESKY_HANDLE = process.env.BLUESKY_HANDLE || '';
 const BLUESKY_APP_PASSWORD = process.env.BLUESKY_APP_PASSWORD || '';
@@ -52,7 +97,7 @@ async function getMastodonLimits() {
   }
 
   try {
-    const res = await fetch(`${MASTODON_INSTANCE_URL}/api/v2/instance`);
+    const res = await fetchWithContext(`${MASTODON_INSTANCE_URL}/api/v2/instance`);
     if (!res.ok) throw new Error(`instance config fetch failed: ${res.status}`);
     const data = await res.json();
     const ma = data?.configuration?.media_attachments;
@@ -109,13 +154,14 @@ async function getLimitsForTargets(targets) {
   };
 }
 
-function humanBytes(n) {
-  return `${(n / (1024 * 1024)).toFixed(1)}MB`;
-}
-
-// Validate the uploaded files against the rules of whichever platforms are
-// actually selected for this post. Returns { images: [file...], video: file|null }.
-// Throws with a user-facing message on any violation.
+// Validate the uploaded files' basic shape against the rules of whichever
+// platforms are actually selected for this post. Returns
+// { images: [file...], video: file|null }. Throws with a user-facing message
+// on violations that a re-encode can't fix (wrong file category entirely, or
+// too many files). Format and byte-size limits are NOT enforced here — the
+// background editor (optimizeMediaForTarget, below) brings each file into
+// spec for each target platform right before it's sent, instead of rejecting
+// the upload outright.
 async function validateMedia(files, targets) {
   if (!files || files.length === 0) return { images: [], video: null };
 
@@ -140,30 +186,43 @@ async function validateMedia(files, targets) {
   }
 
   if (videos.length === 1) {
-    const video = videos[0];
-    if (!limits.videoMimeTypes.includes(video.mimetype)) {
-      throw new Error(`Video format ${video.mimetype} isn't supported by ${platformNote}. Use MP4.`);
-    }
-    if (video.size > limits.videoMaxBytes) {
-      throw new Error(`Video is ${humanBytes(video.size)}, which exceeds the ${humanBytes(limits.videoMaxBytes)} limit for ${platformNote}.`);
-    }
-    return { images: [], video };
+    return { images: [], video: videos[0] };
   }
 
+  // The editor re-encodes/shrinks files, but it won't silently drop photos
+  // you chose to attach — too many images is still a hard stop.
   if (images.length > limits.maxImages) {
     throw new Error(`Up to ${limits.maxImages} images are allowed per post on ${platformNote}.`);
   }
 
-  for (const img of images) {
-    if (!limits.imageMimeTypes.includes(img.mimetype)) {
-      throw new Error(`Image format ${img.mimetype} (${img.originalname}) isn't supported by ${platformNote}. Use JPEG, PNG, or WebP.`);
-    }
-    if (img.size > limits.imageMaxBytes) {
-      throw new Error(`${img.originalname} is ${humanBytes(img.size)}, which exceeds the ${humanBytes(limits.imageMaxBytes)} limit for ${platformNote}.`);
-    }
+  return { images, video: null };
+}
+
+// Runs the background editor over each attached file so it fits ONE target
+// platform's real limits — resizing/recompressing images, and
+// re-encoding/trimming video as needed. Called once per selected platform
+// (with that platform's own limits) so Bluesky and Mastodon each get a copy
+// tailored to their own requirements, even when those requirements differ.
+// Files that already fit are passed through untouched (see the fast paths in
+// mediaOptimizer.js), so this is cheap when no editing is actually needed.
+async function optimizeMediaForTarget(media, limits) {
+  if (media.video) {
+    const optimized = await optimizeVideoForLimits(media.video.buffer, media.video.mimetype, media.video.originalname, limits);
+    return {
+      images: [],
+      video: { ...media.video, buffer: optimized.buffer, mimetype: optimized.mimetype, size: optimized.buffer.length },
+    };
   }
 
-  return { images, video: null };
+  if (media.images.length > 0) {
+    const images = await Promise.all(media.images.map(async (img) => {
+      const optimized = await optimizeImageForLimits(img.buffer, img.mimetype, limits);
+      return { ...img, buffer: optimized.buffer, mimetype: optimized.mimetype, size: optimized.buffer.length };
+    }));
+    return { images, video: null };
+  }
+
+  return media;
 }
 
 function safeAspectRatio(buffer) {
@@ -180,7 +239,7 @@ function safeAspectRatio(buffer) {
 
 // ---- Bluesky (AT Protocol) ----
 async function blueskyLogin() {
-  const sessionRes = await fetch(`${BLUESKY_SERVICE}/xrpc/com.atproto.server.createSession`, {
+  const sessionRes = await fetchWithContext(`${BLUESKY_SERVICE}/xrpc/com.atproto.server.createSession`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ identifier: BLUESKY_HANDLE, password: BLUESKY_APP_PASSWORD })
@@ -193,7 +252,7 @@ async function blueskyLogin() {
 }
 
 async function blueskyUploadBlob(session, file) {
-  const res = await fetch(`${BLUESKY_SERVICE}/xrpc/com.atproto.repo.uploadBlob`, {
+  const res = await fetchWithContext(`${BLUESKY_SERVICE}/xrpc/com.atproto.repo.uploadBlob`, {
     method: 'POST',
     headers: {
       'Content-Type': file.mimetype,
@@ -243,7 +302,7 @@ async function postToBluesky(text, media, altTexts) {
     record.embed = { $type: 'app.bsky.embed.images', images };
   }
 
-  const postRes = await fetch(`${BLUESKY_SERVICE}/xrpc/com.atproto.repo.createRecord`, {
+  const postRes = await fetchWithContext(`${BLUESKY_SERVICE}/xrpc/com.atproto.repo.createRecord`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -271,7 +330,7 @@ async function mastodonUploadMedia(file, description) {
   form.append('file', new Blob([file.buffer], { type: file.mimetype }), file.originalname);
   if (description) form.append('description', description);
 
-  const res = await fetch(`${MASTODON_INSTANCE_URL}/api/v2/media`, {
+  const res = await fetchWithContext(`${MASTODON_INSTANCE_URL}/api/v2/media`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${MASTODON_ACCESS_TOKEN}` },
     body: form
@@ -290,7 +349,7 @@ async function mastodonUploadMedia(file, description) {
   let attempts = 0;
   while (!media.url && attempts < 15) {
     await new Promise((r) => setTimeout(r, 2000));
-    const pollRes = await fetch(`${MASTODON_INSTANCE_URL}/api/v1/media/${attachmentId}`, {
+    const pollRes = await fetchWithContext(`${MASTODON_INSTANCE_URL}/api/v1/media/${attachmentId}`, {
       headers: { Authorization: `Bearer ${MASTODON_ACCESS_TOKEN}` }
     });
     if (pollRes.status === 200) {
@@ -316,7 +375,7 @@ async function postToMastodon(text, media, altTexts) {
     mediaIds.push(id);
   }
 
-  const res = await fetch(`${MASTODON_INSTANCE_URL}/api/v1/statuses`, {
+  const res = await fetchWithContext(`${MASTODON_INSTANCE_URL}/api/v1/statuses`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -335,10 +394,15 @@ async function postToMastodon(text, media, altTexts) {
 }
 
 // ---- Uploads ----
+// This cap is just a sane upper bound to protect server memory (files are
+// buffered in RAM) — it's intentionally much larger than any platform's
+// actual limit, since the background editor (mediaOptimizer.js) shrinks
+// oversized files down to each platform's real limit before posting.
+const RAW_UPLOAD_MAX_BYTES = 500_000_000; // 500 MB
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: {
-    fileSize: BLUESKY_LIMITS.videoMaxBytes, // largest single-file case (video); per-type checked in validateMedia
+    fileSize: RAW_UPLOAD_MAX_BYTES,
     files: BLUESKY_LIMITS.maxImages,
   }
 });
@@ -374,10 +438,15 @@ app.post('/api/post', upload.array('media', BLUESKY_LIMITS.maxImages), async (re
 
   await Promise.all(targets.map(async (target) => {
     try {
+      // Each platform gets its own edited copy of the media, built against
+      // that platform's own (not the intersected/combined) limits.
+      const targetLimits = await getLimitsForTargets([target]);
+      const optimizedMedia = await optimizeMediaForTarget(media, targetLimits);
+
       if (target === 'bluesky') {
-        results.bluesky = { ok: true, ...(await postToBluesky(text, media, altTexts)) };
+        results.bluesky = { ok: true, ...(await postToBluesky(text, optimizedMedia, altTexts)) };
       } else if (target === 'mastodon') {
-        results.mastodon = { ok: true, ...(await postToMastodon(text, media, altTexts)) };
+        results.mastodon = { ok: true, ...(await postToMastodon(text, optimizedMedia, altTexts)) };
       }
     } catch (e) {
       results[target] = { ok: false, error: e.message };

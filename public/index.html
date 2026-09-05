@@ -191,6 +191,11 @@
     font-size: 12px;
     color: var(--err);
   }
+  .media-notice {
+    margin-top: 8px;
+    font-size: 12px;
+    color: var(--accent);
+  }
 </style>
 </head>
 <body>
@@ -210,6 +215,7 @@
       </label>
       <div class="media-hint" id="mediaHint">Loading media limits…</div>
       <div class="media-grid" id="mediaGrid"></div>
+      <div class="media-notice" id="mediaNotice"></div>
       <div class="media-error" id="mediaError"></div>
     </div>
 
@@ -245,6 +251,7 @@ const mediaInput = document.getElementById('mediaInput');
 const mediaHint = document.getElementById('mediaHint');
 const mediaGrid = document.getElementById('mediaGrid');
 const mediaError = document.getElementById('mediaError');
+const mediaNotice = document.getElementById('mediaNotice');
 
 let rawLimits = null; // { bluesky: {...}, mastodon: {...} } from /api/config
 let mediaLimits = null; // combined limits for the currently checked targets
@@ -297,7 +304,7 @@ function recomputeMediaLimits() {
   mediaHint.textContent =
     `Up to ${mediaLimits.maxImages} images (max ${fmtMB(mediaLimits.imageMaxBytes)} each), ` +
     `or 1 video (max ${fmtMB(mediaLimits.videoMaxBytes)}${durationNote}). ` +
-    `Limits shown are for ${platformNote}.`;
+    `Limits shown are for ${platformNote}. Oversized or unsupported files are auto-optimized per platform before posting.`;
 
   // Already-attached files might now exceed the new (tighter) limits, or be
   // fine again under looser ones — re-check and flag anything that no longer fits.
@@ -306,35 +313,34 @@ function recomputeMediaLimits() {
 
 function reflagExistingMedia() {
   mediaError.textContent = '';
+  mediaNotice.textContent = '';
   if (!mediaLimits) return;
 
   const images = mediaItems.filter(i => i.kind === 'image');
   const video = mediaItems.find(i => i.kind === 'video');
+  const notices = [];
 
   if (video) {
-    if (!mediaLimits.videoMimeTypes.includes(video.file.type)) {
-      mediaError.textContent = `${video.file.name}: format not supported by the currently selected platform(s).`;
-    } else if (video.file.size > mediaLimits.videoMaxBytes) {
-      mediaError.textContent = `${video.file.name} is ${fmtMB(video.file.size)}, over the ${fmtMB(mediaLimits.videoMaxBytes)} limit for the currently selected platform(s).`;
+    if (!mediaLimits.videoMimeTypes.includes(video.file.type) || video.file.size > mediaLimits.videoMaxBytes) {
+      notices.push(`${video.file.name} will be re-encoded to fit each platform's format/size limits before posting.`);
     }
+    if (mediaNotice) mediaNotice.textContent = notices.join(' ');
     return;
   }
 
+  // Too many files is the one thing the background editor can't fix by
+  // itself (it won't silently drop photos you chose to attach).
   if (images.length > mediaLimits.maxImages) {
     mediaError.textContent = `Only ${mediaLimits.maxImages} images allowed for the currently selected platform(s) — remove ${images.length - mediaLimits.maxImages}.`;
     return;
   }
 
   for (const img of images) {
-    if (!mediaLimits.imageMimeTypes.includes(img.file.type)) {
-      mediaError.textContent = `${img.file.name}: format not supported by the currently selected platform(s).`;
-      return;
-    }
-    if (img.file.size > mediaLimits.imageMaxBytes) {
-      mediaError.textContent = `${img.file.name} is ${fmtMB(img.file.size)}, over the ${fmtMB(mediaLimits.imageMaxBytes)} limit for the currently selected platform(s).`;
-      return;
+    if (!mediaLimits.imageMimeTypes.includes(img.file.type) || img.file.size > mediaLimits.imageMaxBytes) {
+      notices.push(`${img.file.name} (${fmtMB(img.file.size)}) will be auto-compressed to fit the ${fmtMB(mediaLimits.imageMaxBytes)} limit.`);
     }
   }
+  mediaNotice.textContent = notices.join(' ');
 }
 
 function renderMediaGrid() {
@@ -382,6 +388,7 @@ function renderMediaGrid() {
 
 function validateNewFiles(files) {
   mediaError.textContent = '';
+  mediaNotice.textContent = '';
   if (!mediaLimits) return [];
 
   const existingImages = mediaItems.filter(i => i.kind === 'image').length;
@@ -403,7 +410,11 @@ function validateNewFiles(files) {
     return [];
   }
 
+  // Format/size mismatches are no longer blocking — the server-side editor
+  // re-encodes each file per platform right before it's sent. We still flag
+  // it here so it's not a surprise, we just don't reject the file.
   const accepted = [];
+  const notices = [];
   for (const f of incoming) {
     const kind = f.type.startsWith('video/') ? 'video' : f.type.startsWith('image/') ? 'image' : null;
     if (!kind) {
@@ -412,16 +423,12 @@ function validateNewFiles(files) {
     }
     const mimeList = kind === 'video' ? mediaLimits.videoMimeTypes : mediaLimits.imageMimeTypes;
     const maxBytes = kind === 'video' ? mediaLimits.videoMaxBytes : mediaLimits.imageMaxBytes;
-    if (!mimeList.includes(f.type)) {
-      mediaError.textContent = `${f.name}: format not supported by the currently selected platform(s).`;
-      continue;
-    }
-    if (f.size > maxBytes) {
-      mediaError.textContent = `${f.name} is ${fmtMB(f.size)}, over the ${fmtMB(maxBytes)} limit for the currently selected platform(s).`;
-      continue;
+    if (!mimeList.includes(f.type) || f.size > maxBytes) {
+      notices.push(`${f.name} (${fmtMB(f.size)}) will be auto-optimized to fit the ${fmtMB(maxBytes)} limit before posting.`);
     }
     accepted.push({ file: f, altText: '', url: URL.createObjectURL(f), kind });
   }
+  if (notices.length) mediaNotice.textContent = notices.join(' ');
   return accepted;
 }
 
@@ -478,7 +485,7 @@ postBtn.addEventListener('click', async () => {
   if (targets.length === 0) return;
 
   postBtn.disabled = true;
-  postBtn.textContent = 'Posting…';
+  postBtn.textContent = mediaItems.length ? 'Optimizing media & posting…' : 'Posting…';
   resultsEl.innerHTML = '';
 
   try {
