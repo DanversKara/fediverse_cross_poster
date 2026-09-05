@@ -56,6 +56,9 @@ async function fetchWithContext(url, options) {
 const BLUESKY_HANDLE = process.env.BLUESKY_HANDLE || '';
 const BLUESKY_APP_PASSWORD = process.env.BLUESKY_APP_PASSWORD || '';
 const BLUESKY_SERVICE = process.env.BLUESKY_SERVICE || 'https://bsky.social';
+// Bluesky video goes through a dedicated transcoding service, not the
+// regular PDS blob endpoint used for images.
+const BLUESKY_VIDEO_SERVICE = 'https://video.bsky.app';
 
 const MASTODON_INSTANCE_URL = (process.env.MASTODON_INSTANCE_URL || 'https://social.chiefgyk3d.com').replace(/\/+$/, '');
 const MASTODON_ACCESS_TOKEN = process.env.MASTODON_ACCESS_TOKEN || '';
@@ -68,9 +71,20 @@ const BLUESKY_LIMITS = {
   maxImages: 4,
   imageMaxBytes: 2_000_000, // 2 MB
   imageMimeTypes: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'],
+  // Not in the lexicon itself, but the Bluesky app/CDN caps rendered image
+  // resolution at 4000px on the longest side — originals bigger than that
+  // (common with modern phone "HDR"/high-res camera modes) get silently
+  // stuck on a never-finishing loading spinner in the app instead of a
+  // clean error.
+  imageMaxDimension: 4000,
   videoMaxBytes: 100_000_000, // 100 MB
   videoMaxDurationSec: 180, // 3 minutes (not verified server-side, no ffprobe available)
   videoMimeTypes: ['video/mp4', 'video/mpeg', 'video/webm', 'video/quicktime'],
+  // AT Protocol's app.bsky.feed.post lexicon caps text at 300 *graphemes*
+  // (not JS string length / UTF-16 units) — this is what was previously
+  // missing, which is why a 414-character post that looked fine against a
+  // hardcoded "500" client-side counter got rejected server-side.
+  textLimit: 300,
 };
 
 // Mastodon limits vary per-instance. We ask the instance for its actual configured
@@ -79,10 +93,16 @@ const BLUESKY_LIMITS = {
 const MASTODON_DEFAULT_LIMITS = {
   maxImages: 4, // vanilla Mastodon's built-in cap on non-poll attachments
   imageMaxBytes: 10_000_000, // 10 MB (default Mastodon config)
+  // Vanilla Mastodon's MAX_MATRIX_LIMIT — total width*height pixels. This is
+  // what actually rejected the 8192x6144 (50.3MP) photo: it's well under the
+  // 10MB byte cap but way over the pixel-count cap, which byte size alone
+  // doesn't catch.
+  imageMaxPixels: 33_177_600,
   videoMaxBytes: 40_000_000, // 40 MB (default Mastodon config)
   imageMimeTypes: ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic', 'image/heif', 'image/avif'],
   videoMimeTypes: ['video/webm', 'video/mp4', 'video/quicktime', 'video/ogg'],
   videoMaxDurationSec: null, // not exposed by the Mastodon instance API
+  textLimit: 500, // vanilla Mastodon's default status character limit
 };
 
 let mastodonLimitsCache = { value: null, fetchedAt: 0 };
@@ -106,10 +126,12 @@ async function getMastodonLimits() {
     const limits = {
       maxImages: st?.max_media_attachments || MASTODON_DEFAULT_LIMITS.maxImages,
       imageMaxBytes: ma?.image_size_limit || MASTODON_DEFAULT_LIMITS.imageMaxBytes,
+      imageMaxPixels: ma?.image_matrix_limit || MASTODON_DEFAULT_LIMITS.imageMaxPixels,
       videoMaxBytes: ma?.video_size_limit || MASTODON_DEFAULT_LIMITS.videoMaxBytes,
       imageMimeTypes: mimeTypes.filter((m) => m.startsWith('image/')),
       videoMimeTypes: mimeTypes.filter((m) => m.startsWith('video/')),
       videoMaxDurationSec: null,
+      textLimit: st?.max_characters || MASTODON_DEFAULT_LIMITS.textLimit,
     };
     mastodonLimitsCache = { value: limits, fetchedAt: now };
     return limits;
@@ -147,11 +169,100 @@ async function getLimitsForTargets(targets) {
   return {
     maxImages: minOf(active.map((l) => l.maxImages)),
     imageMaxBytes: minOf(active.map((l) => l.imageMaxBytes)),
+    imageMaxDimension: minOf(active.map((l) => l.imageMaxDimension)),
+    imageMaxPixels: minOf(active.map((l) => l.imageMaxPixels)),
     imageMimeTypes: intersect(active.map((l) => l.imageMimeTypes)),
     videoMaxBytes: minOf(active.map((l) => l.videoMaxBytes)),
     videoMaxDurationSec: minOf(active.map((l) => l.videoMaxDurationSec)),
     videoMimeTypes: intersect(active.map((l) => l.videoMimeTypes)),
+    textLimit: minOf(active.map((l) => l.textLimit)),
   };
+}
+
+// ---- Grapheme-accurate text splitting (for long posts / threads) ----
+// Bluesky (and most Mastodon instances) count post length in *graphemes*,
+// not JS string length/UTF-16 units, so a couple of emoji or combined
+// characters can silently blow the real limit even when `.length` looks
+// fine. Intl.Segmenter gives us the same notion of "one visible character"
+// that the platforms use.
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+function graphemeLength(str) {
+  return [...graphemeSegmenter.segment(str)].length;
+}
+
+function sliceGraphemes(str, n) {
+  const arr = [...graphemeSegmenter.segment(str)].map((s) => s.segment);
+  return arr.slice(0, n).join('');
+}
+
+// Greedy word-wrap into chunks of at most `limit` graphemes, respecting
+// existing line breaks and word boundaries where possible. Falls back to a
+// hard grapheme-safe cut only for single words/tokens longer than the limit.
+function greedySplit(text, limit) {
+  const paragraphs = text.split('\n');
+  const chunks = [];
+  let current = '';
+  const pushCurrent = () => {
+    if (current.length) chunks.push(current);
+    current = '';
+  };
+
+  paragraphs.forEach((para, pIdx) => {
+    const words = para.split(' ');
+    words.forEach((word) => {
+      const candidate = current ? `${current} ${word}` : word;
+      if (graphemeLength(candidate) <= limit) {
+        current = candidate;
+      } else {
+        pushCurrent();
+        if (graphemeLength(word) <= limit) {
+          current = word;
+        } else {
+          let w = word;
+          while (graphemeLength(w) > limit) {
+            const seg = sliceGraphemes(w, limit);
+            chunks.push(seg);
+            w = w.slice(seg.length);
+          }
+          current = w;
+        }
+      }
+    });
+    if (pIdx < paragraphs.length - 1) {
+      const withBreak = `${current}\n`;
+      if (current && graphemeLength(withBreak) <= limit) {
+        current = withBreak;
+      } else {
+        pushCurrent();
+      }
+    }
+  });
+  pushCurrent();
+  return chunks.map((c) => c.trim()).filter(Boolean);
+}
+
+// Splits `text` into a thread of posts, each within `limit` graphemes,
+// appending a "i/total" counter to every post (e.g. "…\n\n1/3"). If the text
+// already fits, returns it unchanged as a single-element array.
+function splitIntoThread(text, limit) {
+  if (graphemeLength(text) <= limit) return [text];
+
+  const counterLen = (i, total) => graphemeLength(`\n\n${i}/${total}`);
+
+  // Two passes: first estimate the part count with a safe reserve, then
+  // re-split using the exact reserve that count implies (digit width can
+  // change the reserve, e.g. "9/9" vs "10/10").
+  let reserve = 6;
+  let chunks = greedySplit(text, limit - reserve);
+  let total = chunks.length;
+  let exactReserve = counterLen(total, total);
+  if (exactReserve !== reserve) {
+    chunks = greedySplit(text, limit - exactReserve);
+    total = chunks.length;
+  }
+
+  return chunks.map((c, i) => `${c}\n\n${i + 1}/${total}`);
 }
 
 // Validate the uploaded files' basic shape against the rules of whichever
@@ -268,60 +379,221 @@ async function blueskyUploadBlob(session, file) {
   return data.blob;
 }
 
-async function postToBluesky(text, media, altTexts) {
+// Requests a short-lived, scoped token the video service can use to write
+// the processed video blob into the user's own PDS repo on their behalf.
+async function blueskyGetServiceAuth(session, aud, lxm) {
+  const url = new URL(`${BLUESKY_SERVICE}/xrpc/com.atproto.server.getServiceAuth`);
+  url.searchParams.set('aud', aud);
+  url.searchParams.set('lxm', lxm);
+  url.searchParams.set('exp', String(Math.floor(Date.now() / 1000) + 60 * 30)); // 30 min
+
+  const res = await fetchWithContext(url.toString(), {
+    headers: { Authorization: `Bearer ${session.accessJwt}` }
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Bluesky service-auth request failed: ${res.status} ${err}`);
+  }
+  const data = await res.json();
+  return data.token;
+}
+
+// Pulls the hostname of the account's *actual* PDS out of a DID document's
+// service list (the entry with id "#atproto_pds").
+function extractPdsHost(didDoc) {
+  if (!didDoc || !Array.isArray(didDoc.service)) return null;
+  const svc = didDoc.service.find(
+    (s) => s && (s.id === '#atproto_pds' || (typeof s.id === 'string' && s.id.endsWith('#atproto_pds')))
+  );
+  if (!svc || !svc.serviceEndpoint) return null;
+  try {
+    return new URL(svc.serviceEndpoint).host;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Bluesky accounts don't necessarily live on the server you authenticated
+// against — bsky.social is an "entryway" that proxies auth/API calls for
+// accounts actually hosted on many different PDS hosts (e.g.
+// morel.us-east.host.bsky.network). The video service's scoped-token
+// audience has to be the DID of that *real* PDS, not the entryway, or you
+// get "invalid token audience" back. This resolves it from the session's
+// DID document, with a couple of fallbacks for older/self-hosted servers
+// that don't include one on createSession.
+async function blueskyGetPdsHost(session) {
+  const fromSession = extractPdsHost(session.didDoc);
+  if (fromSession) return fromSession;
+
+  try {
+    const res = await fetchWithContext(
+      `${BLUESKY_SERVICE}/xrpc/com.atproto.repo.describeRepo?repo=${encodeURIComponent(session.did)}`,
+      { headers: { Authorization: `Bearer ${session.accessJwt}` } }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const fromDescribe = extractPdsHost(data.didDoc);
+      if (fromDescribe) return fromDescribe;
+    }
+  } catch (e) {
+    // fall through to the last-resort default below
+  }
+
+  // Last resort: assume BLUESKY_SERVICE itself is the PDS. True for
+  // single-account self-hosted PDS setups, just not for bsky.social.
+  return new URL(BLUESKY_SERVICE).host;
+}
+
+// Uploads a video the *correct* way for Bluesky: through the dedicated
+// video.bsky.app transcoding service, then polling until it finishes and
+// hands back a blob reference.
+//
+// The old code path (uploading video via the plain com.atproto.repo.
+// uploadBlob endpoint, same as images) is technically accepted by the PDS,
+// but the video only starts transcoding once the post is already live —
+// so anyone who opens the post in that window sees "Video not found"
+// (this is a known, documented gotcha, not a fluke of any particular file).
+// Going through video.bsky.app first means the video is fully processed
+// *before* we ever create the post.
+async function blueskyUploadVideo(session, file) {
+  const pdsHost = await blueskyGetPdsHost(session);
+  const aud = `did:web:${pdsHost}`;
+  const token = await blueskyGetServiceAuth(session, aud, 'com.atproto.repo.uploadBlob');
+
+  const uploadUrl = new URL(`${BLUESKY_VIDEO_SERVICE}/xrpc/app.bsky.video.uploadVideo`);
+  uploadUrl.searchParams.set('did', session.did);
+  uploadUrl.searchParams.set('name', file.originalname || 'video.mp4');
+
+  const uploadRes = await fetchWithContext(uploadUrl.toString(), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': file.mimetype,
+      'Content-Length': String(file.buffer.length)
+    },
+    body: file.buffer
+  });
+
+  // A 409 here means this exact video was already uploaded — the job
+  // status is still usable, just keep going instead of treating it as a
+  // hard failure.
+  if (!uploadRes.ok && uploadRes.status !== 409) {
+    const err = await uploadRes.text();
+    throw new Error(`Bluesky video upload failed: ${uploadRes.status} ${err}`);
+  }
+
+  let jobStatus = await uploadRes.json();
+
+  // Poll app.bsky.video.getJobStatus until the video is fully transcoded
+  // (or fails) — this is what guarantees the video actually exists by the
+  // time we create the post referencing it. Video processing commonly
+  // takes anywhere from a few seconds to a couple of minutes.
+  const maxAttempts = 90; // ~7.5 minutes at 5s intervals
+  let attempts = 0;
+  while (!jobStatus.blob) {
+    if (jobStatus.state === 'JOB_STATE_FAILED') {
+      throw new Error(`Bluesky video processing failed: ${jobStatus.error || jobStatus.message || 'unknown error'}`);
+    }
+    if (attempts >= maxAttempts) {
+      throw new Error('Bluesky video processing timed out — try a shorter/smaller video.');
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+
+    const statusUrl = new URL(`${BLUESKY_VIDEO_SERVICE}/xrpc/app.bsky.video.getJobStatus`);
+    statusUrl.searchParams.set('jobId', jobStatus.jobId);
+    const statusRes = await fetchWithContext(statusUrl.toString());
+    if (!statusRes.ok) {
+      const err = await statusRes.text();
+      throw new Error(`Bluesky video status check failed: ${statusRes.status} ${err}`);
+    }
+    const data = await statusRes.json();
+    jobStatus = data.jobStatus;
+    attempts++;
+  }
+
+  return jobStatus.blob;
+}
+
+// Turns an at:// record URI into a clickable bsky.app web link.
+function blueskyPostUrlFromUri(uri) {
+  const m = /^at:\/\/(did:[^/]+)\/app\.bsky\.feed\.post\/([^/]+)$/.exec(uri || '');
+  return m ? `https://bsky.app/profile/${m[1]}/post/${m[2]}` : undefined;
+}
+
+// Posts `parts` (one or more strings, each already within Bluesky's 300
+// grapheme limit) as a single connected thread: part 2+ reply to the
+// previous post, and all of them share the same thread root. Media (if any)
+// is attached only to the first post, matching how threads normally work.
+async function postToBluesky(parts, media, altTexts) {
   if (!BLUESKY_HANDLE || !BLUESKY_APP_PASSWORD) {
     throw new Error('Bluesky credentials not configured (BLUESKY_HANDLE / BLUESKY_APP_PASSWORD).');
   }
 
   const session = await blueskyLogin();
 
-  const record = {
-    $type: 'app.bsky.feed.post',
-    text,
-    createdAt: new Date().toISOString()
-  };
+  let root = null;
+  let parent = null;
+  const posts = [];
 
-  if (media.video) {
-    const blob = await blueskyUploadBlob(session, media.video);
-    record.embed = {
-      $type: 'app.bsky.embed.video',
-      video: blob,
-      alt: (altTexts && altTexts[0]) || undefined,
+  for (let i = 0; i < parts.length; i++) {
+    const record = {
+      $type: 'app.bsky.feed.post',
+      text: parts[i],
+      createdAt: new Date().toISOString()
     };
-  } else if (media.images.length > 0) {
-    const images = [];
-    for (let i = 0; i < media.images.length; i++) {
-      const file = media.images[i];
-      const blob = await blueskyUploadBlob(session, file);
-      images.push({
-        image: blob,
-        alt: (altTexts && altTexts[i]) || '',
-        aspectRatio: safeAspectRatio(file.buffer),
-      });
+
+    if (i === 0 && media.video) {
+      const blob = await blueskyUploadVideo(session, media.video);
+      record.embed = {
+        $type: 'app.bsky.embed.video',
+        video: blob,
+        alt: (altTexts && altTexts[0]) || undefined,
+      };
+    } else if (i === 0 && media.images.length > 0) {
+      const images = [];
+      for (let j = 0; j < media.images.length; j++) {
+        const file = media.images[j];
+        const blob = await blueskyUploadBlob(session, file);
+        images.push({
+          image: blob,
+          alt: (altTexts && altTexts[j]) || '',
+          aspectRatio: safeAspectRatio(file.buffer),
+        });
+      }
+      record.embed = { $type: 'app.bsky.embed.images', images };
     }
-    record.embed = { $type: 'app.bsky.embed.images', images };
+
+    if (parent) {
+      record.reply = { root, parent };
+    }
+
+    const postRes = await fetchWithContext(`${BLUESKY_SERVICE}/xrpc/com.atproto.repo.createRecord`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${session.accessJwt}`
+      },
+      body: JSON.stringify({
+        repo: session.did,
+        collection: 'app.bsky.feed.post',
+        record
+      })
+    });
+
+    if (!postRes.ok) {
+      const err = await postRes.text();
+      throw new Error(`Bluesky post ${i + 1}/${parts.length} failed: ${postRes.status} ${err}`);
+    }
+
+    const data = await postRes.json();
+    const ref = { uri: data.uri, cid: data.cid };
+    if (!root) root = ref;
+    parent = ref;
+    posts.push(ref);
   }
 
-  const postRes = await fetchWithContext(`${BLUESKY_SERVICE}/xrpc/com.atproto.repo.createRecord`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${session.accessJwt}`
-    },
-    body: JSON.stringify({
-      repo: session.did,
-      collection: 'app.bsky.feed.post',
-      record
-    })
-  });
-
-  if (!postRes.ok) {
-    const err = await postRes.text();
-    throw new Error(`Bluesky post failed: ${postRes.status} ${err}`);
-  }
-
-  const data = await postRes.json();
-  return { uri: data.uri, cid: data.cid };
+  const thread = posts.map((p) => ({ uri: p.uri, cid: p.cid, url: blueskyPostUrlFromUri(p.uri) }));
+  return { uri: posts[0].uri, cid: posts[0].cid, url: thread[0].url, thread };
 }
 
 // ---- Mastodon ----
@@ -363,7 +635,10 @@ async function mastodonUploadMedia(file, description) {
   return attachmentId;
 }
 
-async function postToMastodon(text, media, altTexts) {
+// Posts `parts` (one or more strings) as a single connected Mastodon
+// thread: each status after the first sets in_reply_to_id to the previous
+// one. Media (if any) is attached only to the first status.
+async function postToMastodon(parts, media, altTexts) {
   if (!MASTODON_ACCESS_TOKEN) {
     throw new Error('Mastodon access token not configured (MASTODON_ACCESS_TOKEN).');
   }
@@ -375,22 +650,34 @@ async function postToMastodon(text, media, altTexts) {
     mediaIds.push(id);
   }
 
-  const res = await fetchWithContext(`${MASTODON_INSTANCE_URL}/api/v1/statuses`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${MASTODON_ACCESS_TOKEN}`
-    },
-    body: JSON.stringify({ status: text, visibility: 'public', media_ids: mediaIds })
-  });
+  let inReplyTo = null;
+  const posts = [];
 
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Mastodon post failed: ${res.status} ${err}`);
+  for (let i = 0; i < parts.length; i++) {
+    const body = { status: parts[i], visibility: 'public' };
+    if (i === 0 && mediaIds.length) body.media_ids = mediaIds;
+    if (inReplyTo) body.in_reply_to_id = inReplyTo;
+
+    const res = await fetchWithContext(`${MASTODON_INSTANCE_URL}/api/v1/statuses`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${MASTODON_ACCESS_TOKEN}`
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Mastodon post ${i + 1}/${parts.length} failed: ${res.status} ${err}`);
+    }
+
+    const data = await res.json();
+    inReplyTo = data.id;
+    posts.push({ url: data.url, id: data.id });
   }
 
-  const data = await res.json();
-  return { url: data.url, id: data.id };
+  return { url: posts[0].url, id: posts[0].id, thread: posts };
 }
 
 // ---- Uploads ----
@@ -409,18 +696,28 @@ const upload = multer({
 
 // ---- API routes ----
 app.post('/api/post', upload.array('media', BLUESKY_LIMITS.maxImages), async (req, res) => {
-  const text = (req.body?.text || '').trim();
   let targets = [];
   let altTexts = [];
+  let parts = [];
 
   try {
     targets = JSON.parse(req.body?.targets || '[]');
     altTexts = JSON.parse(req.body?.altTexts || '[]');
+    // `parts` is the (possibly thread-split) list of post bodies, already
+    // divided client-side into pieces that fit the selected platforms'
+    // combined text limit, and already carrying their "i/total" counters.
+    // A normal, non-split post is just a one-element array.
+    if (req.body?.parts) {
+      parts = JSON.parse(req.body.parts);
+    } else if (req.body?.text) {
+      // Back-compat fallback for any older client still sending `text`.
+      parts = [String(req.body.text).trim()];
+    }
   } catch (e) {
     return res.status(400).json({ error: 'Malformed request.' });
   }
 
-  if (!text) {
+  if (!Array.isArray(parts) || parts.length === 0 || parts.some((p) => typeof p !== 'string' || !p.trim())) {
     return res.status(400).json({ error: 'Post text is required.' });
   }
   if (!Array.isArray(targets) || targets.length === 0) {
@@ -444,9 +741,9 @@ app.post('/api/post', upload.array('media', BLUESKY_LIMITS.maxImages), async (re
       const optimizedMedia = await optimizeMediaForTarget(media, targetLimits);
 
       if (target === 'bluesky') {
-        results.bluesky = { ok: true, ...(await postToBluesky(text, optimizedMedia, altTexts)) };
+        results.bluesky = { ok: true, ...(await postToBluesky(parts, optimizedMedia, altTexts)) };
       } else if (target === 'mastodon') {
-        results.mastodon = { ok: true, ...(await postToMastodon(text, optimizedMedia, altTexts)) };
+        results.mastodon = { ok: true, ...(await postToMastodon(parts, optimizedMedia, altTexts)) };
       }
     } catch (e) {
       results[target] = { ok: false, error: e.message };

@@ -31,24 +31,50 @@ function run(cmd, args) {
 
 // ---------------- Images ----------------
 
-// Shrinks/re-encodes an image until it satisfies a platform's byte limit and
-// mime-type allow-list. Fast path: if the file already fits and is already
-// an allowed format, it's passed through untouched so we never re-compress
-// (and lose quality on) a file that didn't need it.
+// Shrinks/re-encodes an image until it satisfies a platform's byte limit,
+// pixel-dimension limit(s), and mime-type allow-list. Fast path: if the file
+// already fits all of those and is already an allowed format, it's passed
+// through untouched so we never re-compress (and lose quality on) a file
+// that didn't need it.
+//
+// Byte size and dimensions are checked independently — a photo can be well
+// under the byte cap (e.g. a well-compressed 8192x6144 JPEG) while still
+// exceeding a platform's resolution limits. That mismatch is exactly what
+// caused Mastodon's "8192x6144 images are not supported" (its
+// image_matrix_limit — total width*height — not its byte-size limit) and
+// Bluesky's silent, never-finishing loading spinner on images above its
+// ~4000px-per-side ceiling.
 async function optimizeImageForLimits(buffer, mimetype, limits) {
+  const meta = await sharp(buffer, { failOn: 'none' }).rotate().metadata();
+  const originalWidth = meta.width || 2048;
+  const originalHeight = meta.height || 2048;
+  const originalPixels = originalWidth * originalHeight;
+  const originalMaxSide = Math.max(originalWidth, originalHeight);
+
   const formatAllowed = limits.imageMimeTypes.includes(mimetype);
-  if (formatAllowed && buffer.length <= limits.imageMaxBytes) {
+  const sizeAllowed = buffer.length <= limits.imageMaxBytes;
+  const dimensionAllowed = !limits.imageMaxDimension || originalMaxSide <= limits.imageMaxDimension;
+  const pixelsAllowed = !limits.imageMaxPixels || originalPixels <= limits.imageMaxPixels;
+
+  if (formatAllowed && sizeAllowed && dimensionAllowed && pixelsAllowed) {
     return { buffer, mimetype, edited: false };
   }
 
   // JPEG is accepted by both Bluesky and vanilla Mastodon, so recompression
   // always targets JPEG rather than juggling per-format quality knobs.
   const targetBytes = Math.max(1, Math.floor(limits.imageMaxBytes * 0.97));
-  const meta = await sharp(buffer, { failOn: 'none' }).rotate().metadata();
-  const originalWidth = meta.width || 2048;
+
+  // Scale down to satisfy whichever resolution constraint(s) apply,
+  // independent of the byte-size loop below.
+  let scale = 1;
+  if (!dimensionAllowed) {
+    scale = Math.min(scale, limits.imageMaxDimension / originalMaxSide);
+  }
+  if (!pixelsAllowed) {
+    scale = Math.min(scale, Math.sqrt(limits.imageMaxPixels / originalPixels));
+  }
 
   let quality = 88;
-  let scale = 1;
   let bestBuffer = null;
 
   for (let attempt = 0; attempt < 16; attempt++) {

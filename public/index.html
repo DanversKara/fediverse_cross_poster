@@ -196,6 +196,29 @@
     font-size: 12px;
     color: var(--accent);
   }
+  #charCount.over-limit { color: var(--err); font-weight: 600; }
+  .split-confirm {
+    margin-top: 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: #171b24;
+  }
+  .split-confirm p { margin: 0 0 10px; font-size: 13px; color: var(--text); }
+  .split-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  .split-actions button {
+    flex: 1;
+    min-width: 140px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    padding: 8px 10px;
+    font-size: 13px;
+    cursor: pointer;
+    background: #191c21;
+    color: var(--text);
+  }
+  .split-actions #splitYes { background: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .thread-links a { margin-right: 8px; }
 </style>
 </head>
 <body>
@@ -203,9 +226,17 @@
     <h1>Cross-Post</h1>
     <p class="sub">Write once, post to Bluesky &amp; Mastodon.</p>
 
-    <textarea id="text" maxlength="500" placeholder="What's happening?"></textarea>
+    <textarea id="text" placeholder="What's happening?"></textarea>
     <div class="meta-row">
-      <span id="charCount">0 / 500</span>
+      <span id="charCount">0 / 300</span>
+    </div>
+
+    <div class="split-confirm" id="splitConfirm" style="display:none;">
+      <p id="splitMessage"></p>
+      <div class="split-actions">
+        <button id="splitYes" type="button">Split into a thread</button>
+        <button id="splitNo" type="button">Cancel, let me edit</button>
+      </div>
     </div>
 
     <div class="media-section">
@@ -256,10 +287,109 @@ const mediaNotice = document.getElementById('mediaNotice');
 let rawLimits = null; // { bluesky: {...}, mastodon: {...} } from /api/config
 let mediaLimits = null; // combined limits for the currently checked targets
 let mediaItems = []; // [{ file, altText, url, kind: 'image'|'video' }]
+let combinedTextLimit = 300; // combined text limit for the currently checked targets
+let pendingParts = null; // thread parts awaiting the split confirm dialog
 
-textEl.addEventListener('input', () => {
-  charCount.textContent = `${textEl.value.length} / 500`;
-});
+const splitConfirm = document.getElementById('splitConfirm');
+const splitMessage = document.getElementById('splitMessage');
+const splitYesBtn = document.getElementById('splitYes');
+const splitNoBtn = document.getElementById('splitNo');
+
+// ---- Grapheme-accurate text length/splitting ----
+// Bluesky (and most Mastodon instances) count post length in *graphemes*,
+// not JS string length, so emoji/combined characters can quietly blow the
+// real limit even when .length looks fine. Intl.Segmenter (when available)
+// gives us the same "one visible character" count the platforms use.
+const hasSegmenter = typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function';
+const graphemeSegmenter = hasSegmenter ? new Intl.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+
+function graphemeLength(str) {
+  if (graphemeSegmenter) return [...graphemeSegmenter.segment(str)].length;
+  return Array.from(str).length;
+}
+
+function sliceGraphemes(str, n) {
+  if (graphemeSegmenter) {
+    const arr = [...graphemeSegmenter.segment(str)].map(s => s.segment);
+    return arr.slice(0, n).join('');
+  }
+  return Array.from(str).slice(0, n).join('');
+}
+
+function greedySplit(text, limit) {
+  const paragraphs = text.split('\n');
+  const chunks = [];
+  let current = '';
+  const pushCurrent = () => { if (current.length) chunks.push(current); current = ''; };
+
+  paragraphs.forEach((para, pIdx) => {
+    const words = para.split(' ');
+    words.forEach((word) => {
+      const candidate = current ? `${current} ${word}` : word;
+      if (graphemeLength(candidate) <= limit) {
+        current = candidate;
+      } else {
+        pushCurrent();
+        if (graphemeLength(word) <= limit) {
+          current = word;
+        } else {
+          let w = word;
+          while (graphemeLength(w) > limit) {
+            const seg = sliceGraphemes(w, limit);
+            chunks.push(seg);
+            w = w.slice(seg.length);
+          }
+          current = w;
+        }
+      }
+    });
+    if (pIdx < paragraphs.length - 1) {
+      const withBreak = `${current}\n`;
+      if (current && graphemeLength(withBreak) <= limit) {
+        current = withBreak;
+      } else {
+        pushCurrent();
+      }
+    }
+  });
+  pushCurrent();
+  return chunks.map(c => c.trim()).filter(Boolean);
+}
+
+// Splits `text` into a thread: each part within `limit` graphemes, every
+// part carrying a "i/total" counter (e.g. "…\n\n1/3"), all posted together
+// as one connected thread rather than separate unrelated posts.
+function splitIntoThread(text, limit) {
+  if (graphemeLength(text) <= limit) return [text];
+
+  const counterLen = (i, total) => graphemeLength(`\n\n${i}/${total}`);
+
+  let reserve = 6;
+  let chunks = greedySplit(text, limit - reserve);
+  let total = chunks.length;
+  const exactReserve = counterLen(total, total);
+  if (exactReserve !== reserve) {
+    chunks = greedySplit(text, limit - exactReserve);
+    total = chunks.length;
+  }
+
+  return chunks.map((c, i) => `${c}\n\n${i + 1}/${total}`);
+}
+
+function updateCharCount() {
+  const len = graphemeLength(textEl.value);
+  const limit = combinedTextLimit || 300;
+  if (len > limit) {
+    const parts = splitIntoThread(textEl.value.trim(), limit);
+    charCount.textContent = `${len} / ${limit} — will split into ${parts.length} posts`;
+    charCount.classList.add('over-limit');
+  } else {
+    charCount.textContent = `${len} / ${limit}`;
+    charCount.classList.remove('over-limit');
+  }
+}
+
+textEl.addEventListener('input', updateCharCount);
 
 function fmtMB(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
@@ -279,6 +409,8 @@ function recomputeMediaLimits() {
   if (active.length === 0) {
     mediaLimits = null;
     mediaHint.textContent = 'Select a platform to see media limits.';
+    combinedTextLimit = 300;
+    updateCharCount();
     return;
   }
 
@@ -296,6 +428,9 @@ function recomputeMediaLimits() {
     videoMaxDurationSec: minOf(active.map(l => l.videoMaxDurationSec)),
     videoMimeTypes: intersect(active.map(l => l.videoMimeTypes)),
   };
+
+  combinedTextLimit = minOf(active.map(l => l.textLimit)) || 300;
+  updateCharCount();
 
   const platformNote = targets.length > 1 ? 'both selected platforms' : targets[0];
   const durationNote = mediaLimits.videoMaxDurationSec
@@ -477,20 +612,55 @@ async function loadConfig() {
 }
 loadConfig();
 
-postBtn.addEventListener('click', async () => {
+postBtn.addEventListener('click', () => {
   const text = textEl.value.trim();
   if (!text) return;
 
-  const targets = Array.from(document.querySelectorAll('.targets input:checked')).map(i => i.value);
+  const targets = currentTargets();
   if (targets.length === 0) return;
 
+  const limit = combinedTextLimit || 300;
+  const len = graphemeLength(text);
+
+  if (len > limit) {
+    const parts = splitIntoThread(text, limit);
+    const platformNote = targets.length > 1 ? 'both selected platforms' : targets[0];
+    splitMessage.textContent =
+      `Your post is ${len} characters — over the ${limit} limit for ${platformNote}. ` +
+      `Split it into ${parts.length} connected posts (a thread, numbered ${parts.length > 1 ? `1/${parts.length}…${parts.length}/${parts.length}` : ''}) ` +
+      `and post the whole thread to ${platformNote}?`;
+    splitConfirm.style.display = 'block';
+    pendingParts = parts;
+    return;
+  }
+
+  submitPost([text], targets);
+});
+
+splitYesBtn.addEventListener('click', () => {
+  splitConfirm.style.display = 'none';
+  if (!pendingParts) return;
+  const targets = currentTargets();
+  submitPost(pendingParts, targets);
+  pendingParts = null;
+});
+
+splitNoBtn.addEventListener('click', () => {
+  splitConfirm.style.display = 'none';
+  pendingParts = null;
+});
+
+async function submitPost(parts, targets) {
   postBtn.disabled = true;
-  postBtn.textContent = mediaItems.length ? 'Optimizing media & posting…' : 'Posting…';
+  const hasVideo = mediaItems.some(i => i.kind === 'video');
+  postBtn.textContent = parts.length > 1
+    ? `Posting thread (${parts.length} posts)…`
+    : (hasVideo ? 'Uploading & processing video (can take a minute)…' : (mediaItems.length ? 'Optimizing media & posting…' : 'Posting…'));
   resultsEl.innerHTML = '';
 
   try {
     const form = new FormData();
-    form.append('text', text);
+    form.append('parts', JSON.stringify(parts));
     form.append('targets', JSON.stringify(targets));
     form.append('altTexts', JSON.stringify(mediaItems.map(i => i.altText)));
     mediaItems.forEach(i => form.append('media', i.file));
@@ -513,8 +683,18 @@ postBtn.addEventListener('click', async () => {
       const div = document.createElement('div');
       div.className = `result ${result.ok ? 'ok' : 'err'}`;
       if (result.ok) {
-        const link = result.url || result.uri || '';
-        div.innerHTML = `<div class="platform">${platform}</div>Posted successfully.${link ? ` <a href="${link}" target="_blank" rel="noopener">View</a>` : ''}`;
+        // `thread` lists every post in the connected thread (root first);
+        // for a normal single post it's just one entry.
+        const items = (result.thread && result.thread.length ? result.thread : [{ url: result.url || result.uri }]);
+        const isThread = items.length > 1;
+        const links = items
+          .map((t, i) => t.url ? `<a href="${t.url}" target="_blank" rel="noopener">${isThread ? `Post ${i + 1}/${items.length}` : 'View'}</a>` : '')
+          .filter(Boolean)
+          .join('');
+        div.innerHTML =
+          `<div class="platform">${platform}</div>` +
+          `Posted successfully${isThread ? ` as a ${items.length}-post thread` : ''}.` +
+          (links ? `<div class="thread-links">${links}</div>` : '');
       } else {
         div.innerHTML = `<div class="platform">${platform}</div>${result.error}`;
       }
@@ -523,7 +703,7 @@ postBtn.addEventListener('click', async () => {
 
     if (Object.values(data.results || {}).some(r => r.ok)) {
       textEl.value = '';
-      charCount.textContent = '0 / 500';
+      updateCharCount();
       mediaItems.forEach(i => URL.revokeObjectURL(i.url));
       mediaItems = [];
       renderMediaGrid();
@@ -537,7 +717,7 @@ postBtn.addEventListener('click', async () => {
     postBtn.disabled = false;
     postBtn.textContent = 'Post';
   }
-});
+}
 </script>
 </body>
 </html>
